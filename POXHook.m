@@ -1,12 +1,13 @@
-// POXHook v0.3 — 非侵入式探针
-// 只在点击时显示提示，绝不替换实现、绝不改变原行为。
+// POXHook v0.4 — 真正实现「点侧边只弹菜单」
+// 原理：hook handle:didReceiveTap:，绕过原实现（原实现会调 open 开分屏），
+//       改为直接调用 presentMenuAnchoredToHandle:pinned:
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
 static BOOL gDone = NO;
 
-static void toast(NSString *msg, UIColor *bg) {
+static void toast(NSString *msg, UIColor *bg, CGFloat seconds) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *win = nil; CGFloat best = 0;
         for (UIWindow *w in [[UIApplication sharedApplication] windows]) {
@@ -21,61 +22,68 @@ static void toast(NSString *msg, UIColor *bg) {
         l.font = [UIFont boldSystemFontOfSize:13];
         l.textAlignment = NSTextAlignmentCenter;
         l.text = msg;
+        l.numberOfLines = 2;
         [win addSubview:l];
         [win bringSubviewToFront:l];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ [l removeFromSuperview]; });
     });
 }
 
-// ---- 只读探针：用 class_replaceMethod 保持原 IMP 不被破坏 ----
-static IMP gOrigTap;
-static void probe_tap(id self, SEL _cmd, id arg) {
-    toast(@"✓ 走到 handle:didReceiveTap:", nil);
-    if (gOrigTap) ((void (*)(id, SEL, id))gOrigTap)(self, _cmd, arg);
+// 只弹菜单，不 open
+static void show_menu(id self, id handle) {
+    SEL sel = NSSelectorFromString(@"presentMenuAnchoredToHandle:pinned:");
+    if (![self respondsToSelector:sel]) {
+        toast(@"✗ 无 presentMenuAnchoredToHandle:pinned:", [UIColor redColor], 3);
+        return;
+    }
+    IMP imp = [self methodForSelector:sel];
+    void (*fn)(id, SEL, id, BOOL) = (void (*)(id, SEL, id, BOOL))imp;
+    fn(self, sel, handle, NO);
+    toast(@"✓ 已弹菜单（未开分屏）", nil, 2);
 }
 
-static IMP gOrigPan;
-static void probe_pan(id self, SEL _cmd, id arg) {
-    toast(@"✓ 走到 handleSplitPan:", [UIColor orangeColor]);
-    if (gOrigPan) ((void (*)(id, SEL, id))gOrigPan)(self, _cmd, arg);
+static void hook_tap(id self, SEL _cmd, id handle) {
+    toast(@"点击 → 只弹菜单", [UIColor orangeColor], 1.5);
+    show_menu(self, handle);
 }
+
+static IMP gOrigTap = NULL;
+static IMP gOrigTap2 = NULL;
 
 static void install(void) {
     if (gDone) return;
     Class cls = objc_getClass("PullOverViewController");
-    if (!cls) { toast(@"找不到 PullOverViewController", [UIColor redColor]); return; }
+    if (!cls) { toast(@"找不到 PullOverViewController", [UIColor redColor], 4); return; }
 
-    // 先把所有方法名打印出来，方便对照
-    unsigned int count = 0;
-    Method *ms = class_copyMethodList(cls, &count);
-    NSMutableArray *tapLike = [NSMutableArray array];
-    for (unsigned int i = 0; i < count; i++) {
-        NSString *n = NSStringFromSelector(method_getName(ms[i]));
-        if ([n containsString:@"Tap"] || [n containsString:@"tap"] ||
-            [n containsString:@"Pan"] || [n containsString:@"pan"])
-            [tapLike addObject:n];
+    // 尝试多个可能的 selector 名称
+    NSArray *cands = @[@"handle:didReceiveTap:", @"handleDidReceiveTap:",
+                       @"handleTapped:", @"didTapHandle:", @"handleTap:"];
+    NSString *found = nil;
+    for (NSString *c in cands) {
+        Method m = class_getInstanceMethod(cls, NSSelectorFromString(c));
+        if (m) { found = c; break; }
     }
-    free(ms);
-
-    // 只装两个最关键的探针
-    Method mTap = class_getInstanceMethod(cls, NSSelectorFromString(@"handle:didReceiveTap:"));
-    if (mTap) {
-        gOrigTap = method_getImplementation(mTap);
-        method_setImplementation(mTap, (IMP)probe_tap);
+    if (!found) {
+        // 遍历所有方法找最像的
+        unsigned int cnt = 0;
+        Method *ms = class_copyMethodList(cls, &cnt);
+        for (unsigned int i = 0; i < cnt; i++) {
+            NSString *n = NSStringFromSelector(method_getName(ms[i]));
+            if ([n containsString:@"Tap"] || [n containsString:@"tap"]) {
+                found = n; break;
+            }
+        }
+        free(ms);
     }
+    if (!found) { toast(@"✗ 未找到点击方法", [UIColor redColor], 4); return; }
 
-    Method mPan = class_getInstanceMethod(cls, NSSelectorFromString(@"handleSplitPan:"));
-    if (mPan) {
-        gOrigPan = method_getImplementation(mPan);
-        method_setImplementation(mPan, (IMP)probe_pan);
-    }
-
+    Method m = class_getInstanceMethod(cls, NSSelectorFromString(found));
+    gOrigTap = method_getImplementation(m);
+    method_setImplementation(m, (IMP)hook_tap);
     gDone = YES;
-    toast([NSString stringWithFormat:@"探针已装 (tap=%@ pan=%@)",
-           mTap ? @"有" : @"无", mPan ? @"有" : @"无"], nil);
 
-    NSLog(@"[POXHook] tap/pan methods: %@", tapLike);
+    toast([NSString stringWithFormat:@"✓ 拦截 %@", found], nil, 3);
 }
 
 __attribute__((constructor))
