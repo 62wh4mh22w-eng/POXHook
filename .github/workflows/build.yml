@@ -88,17 +88,17 @@ jobs:
           cp POXHook.plist "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/"
           cp POXHook.plist "$STAGE/var/mobile/Library/MobileSubstrate/DynamicLibraries/"
 
-          cat > "$STAGE/DEBIAN/control" <<EOF
-Package: com.minis.poxhook
-Name: POXHook
-Version: $VERSION
-Architecture: iphoneos-arm64
-Description: PullOver-X 点击诊断/修正 hook
-Maintainer: minis
-Author: minis
-Section: Tweaks
-Depends: mobilesubstrate, com.mlgm.pulloverx
-EOF
+          {
+            echo "Package: com.minis.poxhook"
+            echo "Name: POXHook"
+            echo "Version: $VERSION"
+            echo "Architecture: iphoneos-arm64"
+            echo "Description: PullOver-X tap diagnostic hook"
+            echo "Maintainer: minis"
+            echo "Author: minis"
+            echo "Section: Tweaks"
+            echo "Depends: mobilesubstrate, com.mlgm.pulloverx"
+          } > "$STAGE/DEBIAN/control"
 
           DPKG_DEB=dpkg-deb
           command -v dpkg-deb >/dev/null 2>&1 || DPKG_DEB="$(brew --prefix dpkg)/bin/dpkg-deb"
