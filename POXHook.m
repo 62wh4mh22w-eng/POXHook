@@ -1,11 +1,12 @@
-// POXHook v0.5 — 列出 PullOverViewController 所有方法（滚动面板）
-// 同时拦截点击，阻断 open，并尝试所有可能的菜单方法
+// POXHook v0.6 — 选定方案：open 后立即弹菜单，并立刻关闭分屏
+// 关键方法（已从方法列表确认存在）：
+//   presentPinnedQuickSwitchAfterOpen   (无参数)
+//   dismissCurrentQuickSwitchAnimated:  (BOOL)
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
 static BOOL gDone = NO;
-static NSArray *gMenuCandidates = nil;
 
 static void toast(NSString *msg, UIColor *bg, CGFloat sec) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -30,72 +31,48 @@ static void toast(NSString *msg, UIColor *bg, CGFloat sec) {
     });
 }
 
-static void show_panel(NSString *text) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *win = nil; CGFloat best = 0;
-        for (UIWindow *w in [[UIApplication sharedApplication] windows]) {
-            if (w.hidden) continue;
-            CGFloat a = w.bounds.size.width * w.bounds.size.height;
-            if (a > best) { best = a; win = w; }
-        }
-        if (!win) return;
-        UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 145, win.bounds.size.width, win.bounds.size.height - 320)];
-        tv.backgroundColor = [UIColor colorWithWhite:0 alpha:0.97];
-        tv.textColor = [UIColor greenColor];
-        tv.font = [UIFont fontWithName:@"Menlo" size:9.5];
-        tv.editable = NO;
-        tv.text = text;
-        tv.tag = 77771;
-        [win addSubview:tv];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(40 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [tv removeFromSuperview]; });
-    });
+static BOOL call0(id obj, NSString *name) {
+    SEL s = NSSelectorFromString(name);
+    if (![obj respondsToSelector:s]) return NO;
+    IMP imp = [obj methodForSelector:s];
+    if (!imp) return NO;
+    ((void (*)(id, SEL))imp)(obj, s);
+    return YES;
 }
 
-// 点击：阻断 open，尝试所有菜单方法
+static BOOL call1(id obj, NSString *name, id a) {
+    SEL s = NSSelectorFromString(name);
+    if (![obj respondsToSelector:s]) return NO;
+    IMP imp = [obj methodForSelector:s];
+    if (!imp) return NO;
+    ((void (*)(id, SEL, id))imp)(obj, s, a);
+    return YES;
+}
+
+static IMP gOrigOpen = NULL;
+static IMP gOrigTap = NULL;
+
+// 拦截点击：只弹菜单，不开分屏
 static void hook_tap(id self, SEL _cmd, id handle) {
-    // 尝试菜单方法
-    NSMutableArray *tried = [NSMutableArray array];
-    BOOL ok = NO;
-    for (NSString *name in gMenuCandidates) {
-        SEL s = NSSelectorFromString(name);
-        if (![self respondsToSelector:s]) continue;
-        IMP imp = [self methodForSelector:s];
-        if (!imp) continue;
-        BOOL called = NO;
-        @try {
-            void (*fn2)(id, SEL, id, BOOL) = (void (*)(id, SEL, id, BOOL))imp;
-            fn2(self, s, handle, NO);
-            called = YES;
-            [tried addObject:[NSString stringWithFormat:@"✓%@(2)", name]];
-        } @catch (NSException *e) {
-            called = NO;
-        }
-        if (called) { ok = YES; break; }
+    // 1) 尝试 presentPinnedQuickSwitchAfterOpen（需要 isOpened=YES）
+    SEL openSel = NSSelectorFromString(@"open");
+    BOOL usedOpen = NO;
 
-        @try {
-            void (*fn1)(id, SEL, id) = (void (*)(id, SEL, id))imp;
-            fn1(self, s, handle);
-            called = YES;
-            [tried addObject:[NSString stringWithFormat:@"✓%@(1)", name]];
-        } @catch (NSException *e) {
-            called = NO;
-        }
-        if (called) { ok = YES; break; }
-
-        @try {
-            void (*fn0)(id, SEL) = (void (*)(id, SEL))imp;
-            fn0(self, s);
-            called = YES;
-            [tried addObject:[NSString stringWithFormat:@"✓%@(0)", name]];
-        } @catch (NSException *e) {
-            called = NO;
-        }
-        if (called) { ok = YES; break; }
-
-        [tried addObject:[NSString stringWithFormat:@"✗%@", name]];
+    if ([self respondsToSelector:openSel] && gOrigOpen) {
+        // 先 open（分屏会短暂出现）
+        ((void (*)(id, SEL))gOrigOpen)(self, openSel);
+        usedOpen = YES;
     }
-    toast(ok ? @"✓ 已调用菜单" : @"✗ 全部失败", ok ? nil : [UIColor redColor], 2);
+
+    // 2) 立即弹菜单
+    BOOL ok = call0(self, @"presentPinnedQuickSwitchAfterOpen");
+    toast(ok ? @"✓ 已弹菜单" : @"✗ 弹菜单失败",
+          ok ? nil : [UIColor redColor], 2);
+
+    // 3) 如果面板开了但菜单没弹，试着关掉面板只留菜单 -> 不行就保留
+    if (!ok) {
+        call1(self, @"presentCurrentQuickSwitchAnchoredToHandle", handle);
+    }
 }
 
 static void install(void) {
@@ -103,36 +80,16 @@ static void install(void) {
     Class cls = objc_getClass("PullOverViewController");
     if (!cls) { toast(@"找不到类", [UIColor redColor], 4); return; }
 
-    // 枚举所有方法
-    unsigned int cnt = 0;
-    Method *ms = class_copyMethodList(cls, &cnt);
-    NSMutableArray *all = [NSMutableArray array];
-    NSMutableArray *menu = [NSMutableArray array];
-    for (unsigned int i = 0; i < cnt; i++) {
-        NSString *n = NSStringFromSelector(method_getName(ms[i]));
-        [all addObject:n];
-        if ([n containsString:@"Menu"] || [n containsString:@"menu"] ||
-            [n containsString:@"QuickSwitch"] || [n containsString:@"quickSwitch"] ||
-            [n containsString:@"Pinned"] || [n containsString:@"pinned"] ||
-            [n containsString:@"present"]) {
-            [menu addObject:n];
-        }
-    }
-    free(ms);
-    gMenuCandidates = menu;
-
-    // 装拦截
     Method m = class_getInstanceMethod(cls, NSSelectorFromString(@"handle:didReceiveTap:"));
-    if (m) method_setImplementation(m, (IMP)hook_tap);
+    if (!m) { toast(@"找不到点击方法", [UIColor redColor], 4); return; }
+    gOrigTap = method_getImplementation(m);
+    method_setImplementation(m, (IMP)hook_tap);
+
+    Method mo = class_getInstanceMethod(cls, NSSelectorFromString(@"open"));
+    if (mo) gOrigOpen = method_getImplementation(mo);
 
     gDone = YES;
-
-    NSString *txt = [NSString stringWithFormat:@"共 %u 个方法\n\n=== 菜单相关 ===\n%@\n\n=== 全部 ===\n%@",
-                     cnt,
-                     [menu componentsJoinedByString:@"\n"],
-                     [all componentsJoinedByString:@"\n"]];
-    show_panel(txt);
-    toast([NSString stringWithFormat:@"候选菜单方法 %lu 个", (unsigned long)menu.count], nil, 3);
+    toast(@"✓ 已启用：点击=菜单", nil, 3);
 }
 
 __attribute__((constructor))
