@@ -1,24 +1,21 @@
-// POXHook v0.2 — 枚举 + 全量 hook 探针
-// 目标：找出点侧边真正触发的方法
+// POXHook v0.3 — 非侵入式探针
+// 只在点击时显示提示，绝不替换实现、绝不改变原行为。
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
-static BOOL gPatched = NO;
-static NSMutableArray *gHooked = nil;
+static BOOL gDone = NO;
 
-// ---------- 顶部提示 ----------
 static void toast(NSString *msg, UIColor *bg) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *win = nil;
-        CGFloat best = 0;
+        UIWindow *win = nil; CGFloat best = 0;
         for (UIWindow *w in [[UIApplication sharedApplication] windows]) {
             if (w.hidden) continue;
             CGFloat a = w.bounds.size.width * w.bounds.size.height;
             if (a > best) { best = a; win = w; }
         }
         if (!win) return;
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(0, 100, win.bounds.size.width, 40)];
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(0, 100, win.bounds.size.width, 36)];
         l.backgroundColor = bg ?: [UIColor colorWithRed:0.15 green:0.85 blue:0.3 alpha:0.95];
         l.textColor = [UIColor blackColor];
         l.font = [UIFont boldSystemFontOfSize:13];
@@ -31,76 +28,60 @@ static void toast(NSString *msg, UIColor *bg) {
     });
 }
 
-// ---------- 通用 hook ----------
-static void (*gOrig)(id, SEL, ...) = NULL;
-
-static void generic_hook(id self, SEL _cmd, ...) {
-    NSString *name = NSStringFromSelector(_cmd);
-    toast([NSString stringWithFormat:@"命中: %@", name], nil);
-    NSLog(@"[POXHook] HIT %@", name);
+// ---- 只读探针：用 class_replaceMethod 保持原 IMP 不被破坏 ----
+static IMP gOrigTap;
+static void probe_tap(id self, SEL _cmd, id arg) {
+    toast(@"✓ 走到 handle:didReceiveTap:", nil);
+    if (gOrigTap) ((void (*)(id, SEL, id))gOrigTap)(self, _cmd, arg);
 }
 
-static void patch_method(Class cls, SEL sel) {
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
-    IMP old = method_getImplementation(m);
-    if (old == (IMP)generic_hook) return;
-    method_setImplementation(m, (IMP)generic_hook);
-    if (!gHooked) gHooked = [NSMutableArray array];
-    [gHooked addObject:NSStringFromSelector(sel)];
+static IMP gOrigPan;
+static void probe_pan(id self, SEL _cmd, id arg) {
+    toast(@"✓ 走到 handleSplitPan:", [UIColor orangeColor]);
+    if (gOrigPan) ((void (*)(id, SEL, id))gOrigPan)(self, _cmd, arg);
 }
 
-static void pox_patch(void) {
-    if (gPatched) return;
+static void install(void) {
+    if (gDone) return;
     Class cls = objc_getClass("PullOverViewController");
     if (!cls) { toast(@"找不到 PullOverViewController", [UIColor redColor]); return; }
 
-    // 枚举所有方法，凡是名字里带 tap/pan/handle/longpress/gesture 的全都挂上
+    // 先把所有方法名打印出来，方便对照
     unsigned int count = 0;
     Method *ms = class_copyMethodList(cls, &count);
-    NSMutableArray *names = [NSMutableArray array];
+    NSMutableArray *tapLike = [NSMutableArray array];
     for (unsigned int i = 0; i < count; i++) {
         NSString *n = NSStringFromSelector(method_getName(ms[i]));
-        [names addObject:n];
-        BOOL hit = NO;
-        for (NSString *k in @[@"Tap", @"tap", @"Pan", @"pan", @"handle:", @"LongPress", @"Gesture", @"gesture"]) {
-            if ([n rangeOfString:k].location != NSNotFound) { hit = YES; break; }
-        }
-        if (hit) patch_method(cls, method_getName(ms[i]));
+        if ([n containsString:@"Tap"] || [n containsString:@"tap"] ||
+            [n containsString:@"Pan"] || [n containsString:@"pan"])
+            [tapLike addObject:n];
     }
     free(ms);
 
-    gPatched = YES;
-    NSLog(@"[POXHook] all methods: %@", names);
-    toast([NSString stringWithFormat:@"已挂 %lu 个方法（共 %u）",
-           (unsigned long)gHooked.count, count], nil);
+    // 只装两个最关键的探针
+    Method mTap = class_getInstanceMethod(cls, NSSelectorFromString(@"handle:didReceiveTap:"));
+    if (mTap) {
+        gOrigTap = method_getImplementation(mTap);
+        method_setImplementation(mTap, (IMP)probe_tap);
+    }
 
-    // 同时打印方法全名到屏幕（分屏显示）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        UIWindow *win = nil; CGFloat best = 0;
-        for (UIWindow *w in [[UIApplication sharedApplication] windows]) {
-            if (w.hidden) continue;
-            CGFloat a = w.bounds.size.width * w.bounds.size.height;
-            if (a > best) { best = a; win = w; }
-        }
-        if (!win) return;
-        UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 140, win.bounds.size.width, 260)];
-        tv.backgroundColor = [UIColor colorWithWhite:0 alpha:0.95];
-        tv.textColor = [UIColor greenColor];
-        tv.font = [UIFont fontWithName:@"Menlo" size:9];
-        tv.editable = NO;
-        tv.text = [names componentsJoinedByString:@"\n"];
-        [win addSubview:tv];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [tv removeFromSuperview]; });
-    });
+    Method mPan = class_getInstanceMethod(cls, NSSelectorFromString(@"handleSplitPan:"));
+    if (mPan) {
+        gOrigPan = method_getImplementation(mPan);
+        method_setImplementation(mPan, (IMP)probe_pan);
+    }
+
+    gDone = YES;
+    toast([NSString stringWithFormat:@"探针已装 (tap=%@ pan=%@)",
+           mTap ? @"有" : @"无", mPan ? @"有" : @"无"], nil);
+
+    NSLog(@"[POXHook] tap/pan methods: %@", tapLike);
 }
 
 __attribute__((constructor))
 static void pox_init(void) {
     @autoreleasepool {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ pox_patch(); });
+                       dispatch_get_main_queue(), ^{ install(); });
     }
 }
