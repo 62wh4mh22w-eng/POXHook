@@ -1,7 +1,5 @@
-// POXHook v0.6 — 选定方案：open 后立即弹菜单，并立刻关闭分屏
-// 关键方法（已从方法列表确认存在）：
-//   presentPinnedQuickSwitchAfterOpen   (无参数)
-//   dismissCurrentQuickSwitchAnimated:  (BOOL)
+// POXHook v0.7 — 直接调 layoutMenu，绕过 open
+// 目标：点侧边 -> 只弹菜单，不打开分屏
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -17,7 +15,7 @@ static void toast(NSString *msg, UIColor *bg, CGFloat sec) {
             if (a > best) { best = a; win = w; }
         }
         if (!win) return;
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(0, 100, win.bounds.size.width, 36)];
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(0, 100, win.bounds.size.width, 40)];
         l.backgroundColor = bg ?: [UIColor colorWithRed:0.15 green:0.85 blue:0.3 alpha:0.95];
         l.textColor = [UIColor blackColor];
         l.font = [UIFont boldSystemFontOfSize:12];
@@ -31,48 +29,35 @@ static void toast(NSString *msg, UIColor *bg, CGFloat sec) {
     });
 }
 
-static BOOL call0(id obj, NSString *name) {
-    SEL s = NSSelectorFromString(name);
-    if (![obj respondsToSelector:s]) return NO;
-    IMP imp = [obj methodForSelector:s];
-    if (!imp) return NO;
-    ((void (*)(id, SEL))imp)(obj, s);
-    return YES;
+// 直接用 objc_msgSend 发消息（不检查 respondsToSelector）
+static void send_void3(id obj, SEL sel, id a1, BOOL a2, double a3) {
+    typedef void (*Fn)(id, SEL, id, BOOL, double);
+    ((Fn)objc_msgSend)(obj, sel, a1, a2, a3);
 }
 
-static BOOL call1(id obj, NSString *name, id a) {
-    SEL s = NSSelectorFromString(name);
-    if (![obj respondsToSelector:s]) return NO;
-    IMP imp = [obj methodForSelector:s];
-    if (!imp) return NO;
-    ((void (*)(id, SEL, id))imp)(obj, s, a);
-    return YES;
-}
-
-static IMP gOrigOpen = NULL;
-static IMP gOrigTap = NULL;
-
-// 拦截点击：只弹菜单，不开分屏
 static void hook_tap(id self, SEL _cmd, id handle) {
-    // 1) 尝试 presentPinnedQuickSwitchAfterOpen（需要 isOpened=YES）
-    SEL openSel = NSSelectorFromString(@"open");
-    BOOL usedOpen = NO;
+    SEL layout = NSSelectorFromString(@"layoutMenuAnchoredToHandle:pinned:remainingOffset:coordinated");
+    SEL present = NSSelectorFromString(@"presentMenuAnchoredToHandle:pinned:");
 
-    if ([self respondsToSelector:openSel] && gOrigOpen) {
-        // 先 open（分屏会短暂出现）
-        ((void (*)(id, SEL))gOrigOpen)(self, openSel);
-        usedOpen = YES;
+    // 方案 A: 直接调 presentMenu（2 参数）
+    if ([self respondsToSelector:present]) {
+        typedef void (*Fn)(id, SEL, id, BOOL);
+        ((Fn)objc_msgSend)(self, present, handle, NO);
+        toast(@"✓ A: presentMenu 已调用", nil, 3);
+        return;
     }
 
-    // 2) 立即弹菜单
-    BOOL ok = call0(self, @"presentPinnedQuickSwitchAfterOpen");
-    toast(ok ? @"✓ 已弹菜单" : @"✗ 弹菜单失败",
-          ok ? nil : [UIColor redColor], 2);
-
-    // 3) 如果面板开了但菜单没弹，试着关掉面板只留菜单 -> 不行就保留
-    if (!ok) {
-        call1(self, @"presentCurrentQuickSwitchAnchoredToHandle", handle);
+    // 方案 B: 直接调 layoutMenu（4 参数）
+    if ([self respondsToSelector:layout]) {
+        send_void3(self, layout, handle, NO, 0.0);
+        toast(@"✓ B: layoutMenu 已调用", nil, 3);
+        return;
     }
+
+    // 方案 C: 两个都不认，把 respondsToSelector 结果报出来
+    toast([NSString stringWithFormat:@"✗ A=%@ B=%@",
+           [self respondsToSelector:present] ? @"有" : @"无",
+           [self respondsToSelector:layout] ? @"有" : @"无"], [UIColor redColor], 5);
 }
 
 static void install(void) {
@@ -82,14 +67,10 @@ static void install(void) {
 
     Method m = class_getInstanceMethod(cls, NSSelectorFromString(@"handle:didReceiveTap:"));
     if (!m) { toast(@"找不到点击方法", [UIColor redColor], 4); return; }
-    gOrigTap = method_getImplementation(m);
     method_setImplementation(m, (IMP)hook_tap);
 
-    Method mo = class_getInstanceMethod(cls, NSSelectorFromString(@"open"));
-    if (mo) gOrigOpen = method_getImplementation(mo);
-
     gDone = YES;
-    toast(@"✓ 已启用：点击=菜单", nil, 3);
+    toast(@"✓ v0.7 已启用", nil, 3);
 }
 
 __attribute__((constructor))
