@@ -1,94 +1,122 @@
-// POXHook v0.8 — 点侧边：open 之后立刻收回分屏，只留菜单
-// 依据方法列表：presentPinnedQuickSwitchAfterOpen / dismissCurrentQuickSwitchAnimated:
-//              animatePanelToOffset:opening: / closePanel ...
+// POXHook v0.9 — 自动测试：枚举所有候选方法并报告哪些存在、哪些可调用
+// 一次性把结论写在屏幕上，不用反复试错
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
 static BOOL gDone = NO;
-static IMP gOrigOpen = NULL;
 
-static void toast(NSString *msg, UIColor *bg, CGFloat sec) {
+static UIWindow *mainWindow(void) {
+    UIWindow *win = nil; CGFloat best = 0;
+    for (UIWindow *w in [[UIApplication sharedApplication] windows]) {
+        if (w.hidden) continue;
+        CGFloat a = w.bounds.size.width * w.bounds.size.height;
+        if (a > best) { best = a; win = w; }
+    }
+    return win;
+}
+
+static void show_result(NSString *text, UIColor *color) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *win = nil; CGFloat best = 0;
-        for (UIWindow *w in [[UIApplication sharedApplication] windows]) {
-            if (w.hidden) continue;
-            CGFloat a = w.bounds.size.width * w.bounds.size.height;
-            if (a > best) { best = a; win = w; }
-        }
+        UIWindow *win = mainWindow();
         if (!win) return;
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(0, 100, win.bounds.size.width, 40)];
-        l.backgroundColor = bg ?: [UIColor colorWithRed:0.15 green:0.85 blue:0.3 alpha:0.95];
-        l.textColor = [UIColor blackColor];
-        l.font = [UIFont boldSystemFontOfSize:12];
-        l.textAlignment = NSTextAlignmentCenter;
-        l.text = msg;
-        l.numberOfLines = 2;
-        [win addSubview:l];
-        [win bringSubviewToFront:l];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [l removeFromSuperview]; });
+        UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 120, win.bounds.size.width, win.bounds.size.height - 260)];
+        tv.backgroundColor = [UIColor colorWithWhite:0 alpha:0.97];
+        tv.textColor = color ?: [UIColor greenColor];
+        tv.font = [UIFont fontWithName:@"Menlo" size:10];
+        tv.editable = NO;
+        tv.text = text;
+        [win addSubview:tv];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [tv removeFromSuperview]; });
     });
 }
 
-static IMP imp_of(id obj, NSString *name) {
-    SEL s = NSSelectorFromString(name);
-    if (![obj respondsToSelector:s]) return NULL;
-    return [obj methodForSelector:s];
+// 列出类的全部方法
+static NSArray *all_methods(Class cls) {
+    unsigned int cnt = 0;
+    Method *ms = class_copyMethodList(cls, &cnt);
+    NSMutableArray *out = [NSMutableArray array];
+    for (unsigned int i = 0; i < cnt; i++) [out addObject:NSStringFromSelector(method_getName(ms[i]))];
+    free(ms);
+    return out;
 }
 
-// 关闭分屏面板，但保留菜单
-static void close_panel_keep_menu(id self) {
-    // 1) 先把菜单弹出来（锚在把手位置）
-    IMP p = imp_of(self, @"presentPinnedQuickSwitchAfterOpen");
-    if (p) ((void (*)(id, SEL))p)(self, NSSelectorFromString(@"presentPinnedQuickSwitchAfterOpen"));
+static NSString *test_run(id self, NSString *selectorName) {
+    SEL s = NSSelectorFromString(selectorName);
+    if (![self respondsToSelector:s]) return [NSString stringWithFormat:@"✗ %@ (不存在)", selectorName];
 
-    // 2) 收起面板（分屏）
-    IMP c = imp_of(self, @"closePanel");
-    if (c) {
-        ((void (*)(id, SEL))c)(self, NSSelectorFromString(@"closePanel"));
-        toast(@"✓ closePanel", nil, 2.5);
-        return;
-    }
-    IMP c2 = imp_of(self, @"closePanelAnimated:");
-    if (c2) {
-        ((void (*)(id, SEL, BOOL))c2)(self, NSSelectorFromString(@"closePanelAnimated:"), NO);
-        toast(@"✓ closePanelAnimated", nil, 2.5);
-        return;
-    }
-    IMP c3 = imp_of(self, @"collpasePanel");
-    if (c3) { ((void (*)(id, SEL))c3)(self, NSSelectorFromString(@"collpasePanel")); return; }
-    IMP c4 = imp_of(self, @"dismissPanel");
-    if (c4) { ((void (*)(id, SEL))c4)(self, NSSelectorFromString(@"dismissPanel")); return; }
+    IMP imp = [self methodForSelector:s];
+    if (!imp) return [NSString stringWithFormat:@"✗ %@ (IMP空)", selectorName];
 
-    toast(@"✗ 没找到关闭面板的方法", [UIColor redColor], 4);
+    @try {
+        ((void (*)(id, SEL))imp)(self, s);
+        return [NSString stringWithFormat:@"✓ %@", selectorName];
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"⚠ %@ (崩溃:%@)", selectorName, e.reason];
+    }
 }
 
-static void hook_open(id self, SEL _cmd) {
-    // 执行原 open（分屏会出来）
-    if (gOrigOpen) ((void (*)(id, SEL))gOrigOpen)(self, _cmd);
+static void run_test(id self) {
+    NSMutableArray *lines = [NSMutableArray array];
+    Class cls = [self class];
 
-    // 马上弹菜单 + 收面板
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        close_panel_keep_menu(self);
-    });
+    [lines addObject:[NSString stringWithFormat:@"类: %s", class_getName(cls)]];
+    [lines addObject:[NSString stringWithFormat:@"父类: %s", class_getName(class_getSuperclass(cls))]];
+
+    // 1. 找所有与"关闭/收起"相关的方法
+    NSMutableArray *closeLike = [NSMutableArray array];
+    NSMutableArray *menuLike = [NSMutableArray array];
+    for (NSString *n in all_methods(cls)) {
+        NSString *low = [n lowercaseString];
+        if ([low containsString:@"close"] || [low containsString:@"dismiss"] ||
+            [low containsString:@"collapse"] || [low containsString:@"hide"] ||
+            [low containsString:@"reset"] || [low containsString:@"minim"])
+            [closeLike addObject:n];
+        if ([low containsString:@"menu"] || [low containsString:@"quickswitch"] ||
+            [low containsString:@"pinned"] || [low containsString:@"present"])
+            [menuLike addObject:n];
+    }
+
+    [lines addObject:@""];
+    [lines addObject:@"=== 关闭/收起类 ==="];
+    [lines addObjectsFromArray:closeLike];
+
+    [lines addObject:@""];
+    [lines addObject:@"=== 菜单类 ==="];
+    [lines addObjectsFromArray:menuLike];
+
+    // 2. 自动实测：逐个调用"关闭"类方法，看哪个能收面板
+    [lines addObject:@""];
+    [lines addObject:@"=== 自动实测 ==="];
+    for (NSString *n in closeLike) {
+        // 只测无参数的
+        if ([n containsString:@":"]) continue;
+        [lines addObject:test_run(self, n)];
+    }
+
+    show_result([lines componentsJoinedByString:@"\n"], [UIColor greenColor]);
+}
+
+static void hook_tap(id self, SEL _cmd, id handle) {
+    run_test(self);
 }
 
 static void install(void) {
     if (gDone) return;
     Class cls = objc_getClass("PullOverViewController");
-    if (!cls) { toast(@"找不到类", [UIColor redColor], 4); return; }
-
-    Method mo = class_getInstanceMethod(cls, NSSelectorFromString(@"open"));
-    if (mo) {
-        gOrigOpen = method_getImplementation(mo);
-        method_setImplementation(mo, (IMP)hook_open);
-    }
-
+    if (!cls) { show_result(@"找不到 PullOverViewController", [UIColor redColor]); return; }
+    Method m = class_getInstanceMethod(cls, NSSelectorFromString(@"handle:didReceiveTap:"));
+    if (!m) { show_result(@"找不到点击方法", [UIColor redColor]); return; }
+    method_setImplementation(m, (IMP)hook_tap);
     gDone = YES;
-    toast([NSString stringWithFormat:@"✓ v0.8 已启用 (open=%@)", mo ? @"有" : @"无"], nil, 3);
+
+    NSMutableString *info = [NSMutableString string];
+    [info appendFormat:@"✓ 自动测试器已启用\n\n"];
+    [info appendFormat:@"点一下侧边开始测试\n\n"];
+    [info appendFormat:@"方法总数: %lu", (unsigned long)all_methods(cls).count];
+    show_result(info, nil);
 }
 
 __attribute__((constructor))
