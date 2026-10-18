@@ -1,0 +1,112 @@
+name: Build POXHook
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version'
+        required: false
+        default: '0.1.0'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=0.1.0-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install tools
+        run: |
+          brew install ldid
+          brew install dpkg
+          if ! command -v dpkg-deb >/dev/null 2>&1; then
+            echo "$(brew --prefix dpkg)/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Build dylib
+        env:
+          SDK: /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk
+        run: |
+          set -e
+          mkdir -p build
+          for ARCH in arm64 arm64e; do
+            clang \
+              -target ${ARCH}-apple-ios15.0 \
+              -isysroot "$SDK" \
+              -I"$SDK/usr/include" \
+              -F"$SDK/System/Library/Frameworks" \
+              -fobjc-arc -shared \
+              -framework UIKit -framework Foundation \
+              -lobjc -lSystem \
+              -install_name @loader_path/POXHook.dylib \
+              -o build/POXHook.$ARCH.dylib \
+              POXHook.m
+            echo "built $ARCH"; file build/POXHook.$ARCH.dylib
+          done
+          lipo -create build/POXHook.arm64.dylib build/POXHook.arm64e.dylib -output build/POXHook.dylib
+          lipo -info build/POXHook.dylib
+
+      - name: Sign
+        run: ldid -S build/POXHook.dylib
+
+      - name: Verify
+        run: |
+          python3 - << 'PYEOF'
+          import struct
+          data = open("build/POXHook.dylib","rb").read()
+          nfat = struct.unpack(">I", data[4:8])[0]
+          print(f"FAT with {nfat} slices")
+          for i in range(nfat):
+              off = 8 + i*20
+              cpu, sub, o, sz, al = struct.unpack(">IIIII", data[off:off+20])
+              tag = "arm64e+LIB64" if sub == 0x80000002 else ("arm64" if sub == 0 else hex(sub))
+              print(f"  slice{i}: {tag} off={o:#x} size={sz}")
+          print("OK")
+          PYEOF
+
+      - name: Package deb
+        run: |
+          set -e
+          VERSION="${{ steps.ver.outputs.version }}"
+          STAGE=build/stage
+          mkdir -p "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries"
+          mkdir -p "$STAGE/var/mobile/Library/MobileSubstrate/DynamicLibraries"
+          mkdir -p "$STAGE/DEBIAN"
+
+          cp build/POXHook.dylib "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/"
+          cp build/POXHook.dylib "$STAGE/var/mobile/Library/MobileSubstrate/DynamicLibraries/"
+          cp POXHook.plist "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/"
+          cp POXHook.plist "$STAGE/var/mobile/Library/MobileSubstrate/DynamicLibraries/"
+
+          cat > "$STAGE/DEBIAN/control" <<EOF
+Package: com.minis.poxhook
+Name: POXHook
+Version: $VERSION
+Architecture: iphoneos-arm64
+Description: PullOver-X 点击诊断/修正 hook
+Maintainer: minis
+Author: minis
+Section: Tweaks
+Depends: mobilesubstrate, com.mlgm.pulloverx
+EOF
+
+          DPKG_DEB=dpkg-deb
+          command -v dpkg-deb >/dev/null 2>&1 || DPKG_DEB="$(brew --prefix dpkg)/bin/dpkg-deb"
+          "$DPKG_DEB" --root-owner-group -Zgzip -b "$STAGE" "build/com.minis.poxhook_${VERSION}_iphoneos-arm64.deb"
+          ls -la build/*.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: POXHook-deb
+          path: build/*.deb
+          retention-days: 90
